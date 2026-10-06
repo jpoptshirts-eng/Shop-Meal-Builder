@@ -22,7 +22,7 @@ import {
   swapSearchQuery,
 } from './lib/recipeIngredientMatch'
 import { getShopListLinesFromUserInput, isLikelyUiPlaceholderList } from './lib/parseShopList'
-import { enrichSuggestionFromCatalog } from './lib/productAutocomplete'
+import { enrichSuggestionFromCatalog, searchProductSuggestions } from './lib/productAutocomplete'
 import {
   SHOP_LIST_HELPER_INITIAL,
 } from './lib/shopInputCopy'
@@ -1516,6 +1516,8 @@ function App() {
   const [folderTransfer, setFolderTransfer] = useState<FolderTransferState | null>(null)
   const [mealRename, setMealRename] = useState<MealRenameState | null>(null)
   const [nameMealModal, setNameMealModal] = useState<NameMealModalState | null>(null)
+  const [newMealName, setNewMealName] = useState('')
+  const [newMealNameError, setNewMealNameError] = useState('')
   const [mealNotes, setMealNotes] = useState<MealNotesState | null>(null)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
   const [chipSnackbarVisible, setChipSnackbarVisible] = useState(false)
@@ -1585,6 +1587,14 @@ function App() {
   const listBuildGenerationRef = useRef(0)
   /** Bumps per image upload so stale OCR results cannot overwrite newer uploads. */
   const uploadGenerationRef = useRef(0)
+  /**
+   * When set, OCR results are delivered to the meal-builder review flow instead of
+   * the removed folder composer textarea.
+   */
+  const mealUploadWaiterRef = useRef<{
+    resolve: (lines: string[]) => void
+    reject: (message: string) => void
+  } | null>(null)
 
   const buildFooterRef = useRef<HTMLElement | null>(null)
   const [buildFooterHeight, setBuildFooterHeight] = useState(0)
@@ -2022,14 +2032,10 @@ function App() {
     const trimmedName = name.replace(/\s+/g, ' ').trim()
     if (!trimmedName) return false
     if (mealTitleExistsInFolder(mealGroups, trimmedName)) {
-      setNameMealModal((prev) =>
-        prev
-          ? {
-              ...prev,
-              error: 'A meal with this name already exists in this folder.\nChoose a different name.',
-            }
-          : prev,
-      )
+      const duplicateError =
+        'A meal with this name already exists in this folder.\nChoose a different name.'
+      setNewMealNameError(duplicateError)
+      setNameMealModal((prev) => (prev ? { ...prev, error: duplicateError } : prev))
       return false
     }
     const serves = household ?? 'Serves 4'
@@ -2057,9 +2063,21 @@ function App() {
     })
     setEssentials([])
     setNameMealModal(null)
+    setNewMealName('')
+    setNewMealNameError('')
     setActiveMealId(meal.id)
     setAppView('mealDraft')
     return true
+  }
+
+  function commitCreateMealFromFolder() {
+    const trimmedName = newMealName.replace(/\s+/g, ' ').trim()
+    if (!trimmedName) {
+      setNewMealNameError('Enter a meal name to continue.')
+      return
+    }
+    setNewMealNameError('')
+    createEmptyNamedMeal(trimmedName)
   }
 
   function handleBuildShop() {
@@ -2230,6 +2248,89 @@ function App() {
   }
 
 
+  function deliverOcrLinesOrPopulateComposer(lines: string[]) {
+    const waiter = mealUploadWaiterRef.current
+    mealUploadWaiterRef.current = null
+    if (waiter) {
+      waiter.resolve(lines)
+      return
+    }
+    populateInputFromOcrLines(lines)
+  }
+
+  function deliverOcrError(message: string) {
+    const waiter = mealUploadWaiterRef.current
+    mealUploadWaiterRef.current = null
+    if (waiter) {
+      waiter.reject(message)
+      return
+    }
+    setListInputError(message)
+  }
+
+  function extractLinesFromFileForMeal(file: File): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      const previous = mealUploadWaiterRef.current
+      if (previous) previous.reject('Upload cancelled.')
+      mealUploadWaiterRef.current = {
+        resolve,
+        reject: (message) => reject(new Error(message)),
+      }
+      handleUploadFile(file)
+    })
+  }
+
+  function addLinesToMeal(mealId: string, lines: string[]) {
+    const nextIngredients = lines
+      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .map((line) => {
+        const top = searchProductSuggestions(line, autocompleteCatalog, 1)[0]
+        if (top) return suggestionToIngredient(top, line)
+        return {
+          id: crypto.randomUUID(),
+          name: line,
+          needText: `You added: ${formatIngredientNeedLabel(line)}`,
+          price: 0,
+          unitPrice: '—',
+          qty: 1,
+          selected: true,
+          image: '🛒',
+          matched: false,
+          originalText: line,
+          ingredientIntent: line,
+          ...(() => {
+            const intent = resolveItemIntent({
+              originalInput: line,
+              product: { name: line },
+            })
+            return {
+              normalisedInput: intent.normalisedInput,
+              canonicalIntent: intent.canonicalIntent,
+              selectedProductId: intent.selectedProductId,
+              selectedProductCategoryId: intent.selectedProductCategoryId,
+              selectedProductSubcategoryId: intent.selectedProductSubcategoryId,
+            }
+          })(),
+        } satisfies Ingredient
+      })
+
+    if (nextIngredients.length === 0) return
+
+    setMealGroups((prev) =>
+      prev.map((meal) =>
+        meal.id !== mealId
+          ? meal
+          : {
+              ...meal,
+              expanded: true,
+              ingredients: [...meal.ingredients, ...nextIngredients],
+            },
+      ),
+    )
+    setGenerated(true)
+  }
+
   function populateInputFromOcrLines(lines: string[]) {
     const extracted = lines
       .map((line) => line.trim())
@@ -2255,7 +2356,10 @@ function App() {
   }
 
   function handleUploadFile(file?: File) {
-    if (!file) return
+    if (!file) {
+      deliverOcrError('No file selected.')
+      return
+    }
     // Reset the input values immediately so re-selecting the same file always fires onChange.
     if (fileInputRef.current) fileInputRef.current.value = ''
     if (cameraInputRef.current) cameraInputRef.current.value = ''
@@ -2358,8 +2462,8 @@ function App() {
           if (uploadGen !== uploadGenerationRef.current) return
 
           if (visionLines.length === 0) {
-            setListInputError(
-              "We couldn't read enough from this image. Try another image or enter your meals manually.",
+            deliverOcrError(
+              "We couldn't read enough from this image. Try another image or enter items manually.",
             )
             return
           }
@@ -2367,12 +2471,12 @@ function App() {
           const parsedLines = getShopListLinesFromUserInput(visionLines.join('\n'))
           const extractedLines = parsedLines.length > 0 ? parsedLines : visionLines
           if (extractedLines.length === 0) {
-            setListInputError(
-              "We couldn't read enough from this image. Try another image or enter your meals manually.",
+            deliverOcrError(
+              "We couldn't read enough from this image. Try another image or enter items manually.",
             )
             return
           }
-          populateInputFromOcrLines(extractedLines)
+          deliverOcrLinesOrPopulateComposer(extractedLines)
           return
         }
 
@@ -2513,18 +2617,18 @@ function App() {
         const parsedLines = getShopListLinesFromUserInput(filteredDeduped.join('\n'))
         if (parsedLines.length === 0) {
           if (uploadGen !== uploadGenerationRef.current) return
-          setListInputError(
-            "We couldn't read enough from this image. Try another image or enter your meals manually.",
+          deliverOcrError(
+            "We couldn't read enough from this image. Try another image or enter items manually.",
           )
           return
         }
         if (uploadGen !== uploadGenerationRef.current) return
-        populateInputFromOcrLines(parsedLines)
+        deliverOcrLinesOrPopulateComposer(parsedLines)
       } catch (error) {
         console.error('[OCR] Upload processing failed:', error)
         if (uploadGen !== uploadGenerationRef.current) return
-        setListInputError(
-          "We couldn't read enough from this image. Try another image or enter your meals manually.",
+        deliverOcrError(
+          "We couldn't read enough from this image. Try another image or enter items manually.",
         )
       } finally {
         if (uploadGen === uploadGenerationRef.current) setImageProcessing(false)
@@ -2736,6 +2840,8 @@ function App() {
     setAddItemPanelExpanded(!returning)
     setInputValue('')
     setListInputError('')
+    setNewMealName('')
+    setNewMealNameError('')
     setActiveMealId(null)
     setAppView('mealList')
   }
@@ -3151,6 +3257,8 @@ function App() {
     handleListInputPaste,
     handleListInputKeyDown,
     scheduleScrollComposerForKeyboard,
+    cancelNameMealModal,
+    commitNameMealModal,
   ]
 
   const inputMode: InputMode = deriveInputMode({
@@ -3525,14 +3633,51 @@ function App() {
               </div>
             </div>
 
-        <div className="mx-auto mb-8 w-full max-w-[768px]">
-          <button
-            type="button"
-            className="w-full border border-dashed border-[#333] bg-white px-5 py-4 text-[16px] leading-6 text-[#333] hover:bg-[#fafafa]"
-            onClick={() => setNameMealModal({ name: '', error: '' })}
+        <div className="mx-auto mb-8 w-full max-w-[768px] border border-[#ddd] bg-white p-3 sm:p-4">
+          <form
+            className="flex flex-col gap-3 sm:flex-row sm:items-stretch sm:gap-3"
+            onSubmit={(e) => {
+              e.preventDefault()
+              commitCreateMealFromFolder()
+            }}
           >
-            + Create meal
-          </button>
+            <label htmlFor="folder-create-meal-name" className="sr-only">
+              Meal name
+            </label>
+            <input
+              id="folder-create-meal-name"
+              type="text"
+              maxLength={80}
+              value={newMealName}
+              onChange={(e) => {
+                setNewMealName(e.target.value.slice(0, 80))
+                if (newMealNameError) setNewMealNameError('')
+              }}
+              placeholder="Enter meal name"
+              autoComplete="off"
+              aria-invalid={newMealNameError ? true : undefined}
+              aria-describedby={newMealNameError ? 'folder-create-meal-error' : undefined}
+              className={`min-w-0 flex-1 border bg-[#fafafa] px-3 py-2.5 text-[16px] leading-6 text-[#333] placeholder:text-[#53565A] focus:outline focus:outline-2 focus:outline-[#154734] ${
+                newMealNameError ? 'border-[#a6192e]' : 'border-[#a9a9a9]'
+              }`}
+            />
+            <button
+              type="submit"
+              className="w-full shrink-0 px-6 py-2.5 text-[16px] leading-6 sm:w-auto enabled:bg-[#53565A] enabled:text-white disabled:bg-[#eeeeee] disabled:text-[#a9a9a9]"
+              disabled={!newMealName.trim()}
+            >
+              Create meal
+            </button>
+          </form>
+          {newMealNameError ? (
+            <p
+              id="folder-create-meal-error"
+              className="mt-3 whitespace-pre-line text-[14px] leading-5 text-[#a6192e]"
+              role="alert"
+            >
+              {newMealNameError}
+            </p>
+          ) : null}
         </div>
 
         {hasVisibleMeals && (
@@ -3727,13 +3872,16 @@ function App() {
                     mealTitle={meal.title}
                     catalog={autocompleteCatalog}
                     catalogLoading={catalogLoading}
+                    extracting={imageProcessing}
                     alwaysOpen
-                    disabled={imageProcessing}
+                    disabled={false}
                     onAddProduct={addProductToMeal}
+                    onExtractLinesFromFile={extractLinesFromFileForMeal}
+                    onAddLines={addLinesToMeal}
                   />
                   {totalCount === 0 && (
                     <p className="border-t border-[#ddd] px-4 py-6 text-center text-[16px] leading-6 text-[#53565A]">
-                      Your meal is empty. Start typing above to add your first item.
+                      Your meal is empty. Start typing above or add items from a photo or list.
                     </p>
                   )}
                   {totalCount > 0 && (
@@ -4059,86 +4207,6 @@ function App() {
                   {folderTransfer.mode === 'move' ? 'Move' : 'Copy'}
                 </button>
               ) : null}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {nameMealModal && (
-        <div
-          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30 p-4"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) cancelNameMealModal()
-          }}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="name-meal-dialog-title"
-            className="w-full max-w-[544px] bg-white p-6"
-          >
-            <p
-              id="name-meal-dialog-title"
-              className="text-[16px] font-normal leading-6 text-[#333]"
-            >
-              Create a meal
-            </p>
-            <p className="mt-1 text-[14px] leading-5 text-[#53565A]">
-              Meal name
-            </p>
-            <label htmlFor="name-meal-input" className="sr-only">
-              Meal name
-            </label>
-            <input
-              id="name-meal-input"
-              type="text"
-              autoFocus
-              maxLength={80}
-              value={nameMealModal.name}
-              onChange={(e) =>
-                setNameMealModal((prev) =>
-                  prev ? { ...prev, name: e.target.value.slice(0, 80), error: '' } : prev,
-                )
-              }
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault()
-                  commitNameMealModal()
-                } else if (e.key === 'Escape') {
-                  e.preventDefault()
-                  cancelNameMealModal()
-                }
-              }}
-              className="mt-4 w-full border-b border-[#a9a9a9] bg-transparent pb-3 text-[16px] text-[#333] outline-none focus:border-[#154734]"
-              placeholder="Meal name"
-              autoComplete="off"
-            />
-            <div className="mt-1 flex items-start justify-between gap-3">
-              {nameMealModal.error ? (
-                <p className="whitespace-pre-line text-[14px] leading-5 text-[#a6192e]" role="alert">
-                  {nameMealModal.error}
-                </p>
-              ) : (
-                <span />
-              )}
-              <div className="shrink-0 text-[12px] text-[#53565A]">{nameMealModal.name.length}/80</div>
-            </div>
-            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
-              <button
-                type="button"
-                className="border border-[#333] bg-white px-5 py-2 text-[16px] text-[#333]"
-                onClick={cancelNameMealModal}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="bg-[#53565A] px-5 py-2 text-[16px] text-white disabled:bg-[#eeeeee] disabled:text-[#a9a9a9]"
-                disabled={!nameMealModal.name.trim()}
-                onClick={() => commitNameMealModal()}
-              >
-                Create
-              </button>
             </div>
           </div>
         </div>
