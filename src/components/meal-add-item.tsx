@@ -88,7 +88,7 @@ function isTextListFile(file: File): boolean {
 }
 
 /**
- * Shopping Lists POPMAS autocomplete adapted for Shop Meal Builder.
+ * Shopping Lists product autocomplete adapted for Shop Meal Builder.
  * Selecting a suggestion immediately adds the item — no separate Add button.
  * Secondary path: add from photo / list with review before confirming into this meal.
  */

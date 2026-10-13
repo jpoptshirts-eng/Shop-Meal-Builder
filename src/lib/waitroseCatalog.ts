@@ -1,4 +1,7 @@
-import { getSupabase, isSupabaseConfigured } from './supabaseClient'
+import {
+  loadProductCatalogue,
+  type CatalogueProduct,
+} from '../services/productCatalogue'
 
 export type WaitroseCatalogItem = {
   id: string
@@ -16,8 +19,12 @@ export type WaitroseCatalogItem = {
   popmasType?: string
   /** Optional normalized organic flag supplied by prototype/catalog data. */
   organic?: boolean
-  /** Active promotional copy from POPMAS Offers (e.g. "Was £2.00 Now £1.50", "Save Third"). */
+  /** Active promotional copy from Offers (e.g. "Was £2.00 Now £1.50", "Save Third"). */
   offers?: string
+  /** Raw size string from the CSV Size column. */
+  size?: string
+  /** Display price string as in the CSV (e.g. "£2.45"). */
+  displayPrice?: string
 }
 
 export type WaitroseCatalogPayload = {
@@ -42,189 +49,62 @@ export type EssentialFromCatalog = {
   image: string
 }
 
-/** Resolve a POPMAS imageUrl into a displayable thumbnail value. */
+/** Resolve a product imageUrl into a displayable thumbnail value. */
 export function catalogProductImage(imageUrl: string | null | undefined): string {
   const url = imageUrl?.trim() ?? ''
   return url.startsWith('http') ? url : '🛒'
 }
 
-const STATIC_CATALOG = '/data/waitrose-groceries.json'
-
-const POPMAS_TABLE = 'POPMAS'
-const DEV_POPMAS = '/api/popmas'
-
-function parsePriceText(raw: string | null | undefined): number {
-  if (raw == null || raw === '') return 0
-  const s = String(raw).replace(/,/g, '').replace(/\s/g, '').trim()
-  if (s.startsWith('£')) return Number.parseFloat(s.slice(1)) || 0
-  if (s.endsWith('p')) return (Number.parseFloat(s.slice(0, -1)) || 0) / 100
-  return Number.parseFloat(s) || 0
-}
-
-/** Dev-only: Vite middleware serves live-parsed groceries */
-const DEV_LIVE = '/api/waitrose/groceries'
-
-function isDevLiveAvailable(): boolean {
-  return import.meta.env.DEV
-}
-
-type PopMasCatalogRow = {
-  Order?: number | null
-  imageUrl: string | null
-  Name: string | null
-  Size: string | null
-  Price: string | null
-  'Formatted PPU': string | null
-  'Product Type': string | null
-  Offers?: string | null
-  Range?: string | null
-  Grouping?: string | null
-  Type?: string | null
-}
-
-function mapPopMasRowsToProducts(rows: PopMasCatalogRow[]): WaitroseCatalogItem[] {
-  return rows.map((row, idx) => {
-    const name = (row.Name ?? '').trim()
-    const size = (row.Size ?? '').trim()
-    const unit = row['Formatted PPU']?.trim()
-    const displayName = size ? `${name} (${size})` : name
-    const offers = row.Offers?.trim() || undefined
-    return {
-      id: `${POPMAS_TABLE}-${row.Order ?? idx + 1}`,
-      name: displayName,
-      price: parsePriceText(row.Price),
-      unitPrice: unit || size || '—',
-      imageUrl: row.imageUrl?.trim() || '',
-      productUrl: '',
-      productType: row['Product Type']?.trim() || undefined,
-      range: row.Range?.trim() || undefined,
-      grouping: row.Grouping?.trim() || undefined,
-      popmasType: row.Type?.trim() || undefined,
-      offers,
-    }
-  })
-}
-
-async function loadPopMasCatalog(): Promise<WaitroseCatalogPayload | null> {
-  if (import.meta.env.DEV) {
-    try {
-      const r = await fetch(DEV_POPMAS)
-      if (r.ok) {
-        const rows = (await r.json()) as PopMasCatalogRow[]
-        if (rows.length > 0) {
-          return {
-            source: `supabase:public.${POPMAS_TABLE}`,
-            fetchedAt: new Date().toISOString(),
-            count: rows.length,
-            products: mapPopMasRowsToProducts(rows),
-          }
-        }
-      }
-    } catch {
-      /* continue to browser client path */
-    }
-  }
-
-  if (!isSupabaseConfigured()) return null
-  const db = getSupabase()
-  if (!db) return null
-
-  const pageSize = 1000
-  const rows: PopMasCatalogRow[] = []
-  let from = 0
-
-  while (true) {
-    const to = from + pageSize - 1
-    const { data, error } = await db
-      .from(POPMAS_TABLE)
-        .select(
-          '"Order", "imageUrl", "Name", "Size", "Price", "Formatted PPU", "Product Type", "Offers", "Range", "Grouping", "Type"',
-        )
-      .order('Order', { ascending: true })
-      .range(from, to)
-
-    if (error) return null
-    const batch = (data ?? []) as PopMasCatalogRow[]
-    if (batch.length === 0) break
-    rows.push(...batch)
-    if (batch.length < pageSize) break
-    from += pageSize
-  }
-
-  if (rows.length === 0) return null
-
+export function catalogueProductToWaitroseItem(product: CatalogueProduct): WaitroseCatalogItem {
+  const size = product.size.trim()
+  const displayName = size ? `${product.name} (${size})` : product.name
+  const unit = product.formattedPPU.trim()
+  const offers = product.offers.trim() || undefined
   return {
-    source: `supabase:public.${POPMAS_TABLE}`,
-    fetchedAt: new Date().toISOString(),
-    count: rows.length,
-    products: mapPopMasRowsToProducts(rows),
+    id: product.id,
+    name: displayName,
+    price: Math.max(0, product.numericPrice),
+    unitPrice: unit || size || '—',
+    imageUrl: product.imageUrl.trim(),
+    productUrl: '',
+    productType: product.productType.trim() || undefined,
+    grouping: product.grouping.trim() || undefined,
+    popmasType: product.type.trim() || undefined,
+    offers,
+    size: size || undefined,
+    displayPrice: product.price || undefined,
   }
-}
-
-async function loadStaticOrDevCatalog(): Promise<WaitroseCatalogPayload> {
-  if (isDevLiveAvailable()) {
-    try {
-      const r = await fetch(DEV_LIVE)
-      if (r.ok) return (await r.json()) as WaitroseCatalogPayload
-    } catch {
-      /* continue */
-    }
-  }
-
-  const r = await fetch(STATIC_CATALOG)
-  if (!r.ok) throw new Error(`Catalog fetch failed: ${r.status}`)
-  return (await r.json()) as WaitroseCatalogPayload
 }
 
 /**
- * With Supabase configured: **POPMAS** only (deduped master). No merged POP* tables or `grocery_products`.
- * Without Supabase: static JSON and (in dev) the local Waitrose scrape for prototyping.
+ * Load the Waitrose product catalogue from static CSV files under /public/data/products.
+ * Cached in memory by the productCatalogue service after the first successful load.
  */
 export async function loadWaitroseGroceriesCatalog(): Promise<WaitroseCatalogPayload> {
-  if (isSupabaseConfigured()) {
-    try {
-      const popmas = await loadPopMasCatalog()
-      if (popmas && popmas.products.length > 0) return popmas
-    } catch {
-      /* fall through to error below */
-    }
-    throw new Error(
-      'POPMAS is empty or unavailable. Check Supabase data, RLS, and VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY.',
-    )
+  const products = await loadProductCatalogue()
+  return {
+    source: 'csv:/data/products',
+    fetchedAt: new Date().toISOString(),
+    count: products.length,
+    products: products.map(catalogueProductToWaitroseItem),
   }
-
-  return loadStaticOrDevCatalog()
 }
 
 /**
- * Build-shop retrieval policy:
- * 1) Always use POPMAS as primary when Supabase is configured and available.
- * 2) Only consult static/dev-link catalog as fallback for items missing in POPMAS.
+ * Build-shop / meal-builder retrieval: CSV catalogue is the sole product source.
  */
 export async function loadCatalogForBuildShop(): Promise<BuildShopCatalogPayload> {
-  const popmas = await loadPopMasCatalog()
-  if (!popmas || popmas.products.length === 0) {
-    throw new Error(
-      'POPMAS is empty or unavailable. Check Supabase data, RLS, and VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY.',
-    )
-  }
-
-  try {
-    const fallback = await loadStaticOrDevCatalog()
-    return { primary: popmas, fallback }
-  } catch {
-    return { primary: popmas, fallback: null }
-  }
+  const primary = await loadWaitroseGroceriesCatalog()
+  return { primary, fallback: null }
 }
 
-/** Map catalog rows into essentials. Large lists are capped only by maxItems (default: show many rows). */
+/** Map catalog rows into essentials. Large lists are capped only by maxItems. */
 export function mapWaitroseCatalogToEssentials(
   products: WaitroseCatalogItem[],
   maxItems = 4000,
 ): EssentialFromCatalog[] {
   return products.slice(0, maxItems).map((p, i) => ({
-    id:
-      String(p.id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120) || `row-${i}`,
+    id: String(p.id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120) || `row-${i}`,
     name: p.name,
     price: Math.max(0, p.price),
     unitPrice: p.unitPrice?.trim() || '—',

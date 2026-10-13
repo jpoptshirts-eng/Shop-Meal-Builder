@@ -1,6 +1,10 @@
 import { ALL_MOCK_SUGGESTIONS } from '../data/productSuggestions'
 import type { ProductSuggestion } from './inputExperience'
-import { topCatalogMatches } from './catalogMatch'
+import {
+  getCachedProducts,
+  searchCatalogue,
+  type CatalogueProduct,
+} from '../services/productCatalogue'
 import { catalogProductImage, type WaitroseCatalogItem } from './waitroseCatalog'
 
 const SOURCE_RANK: Record<ProductSuggestion['source'], number> = {
@@ -8,31 +12,6 @@ const SOURCE_RANK: Record<ProductSuggestion['source'], number> = {
   'previous-purchase': 1,
   catalogue: 2,
 }
-
-const ENRICHMENT_SKIP_TOKENS = new Set([
-  'duchy',
-  'organic',
-  'essential',
-  'waitrose',
-  'no1',
-  'wr',
-  'the',
-  'waitrose',
-])
-
-const CATEGORY_TERMS = [
-  'milk',
-  'bread',
-  'butter',
-  'tea',
-  'coffee',
-  'egg',
-  'juice',
-  'cereal',
-  'cheese',
-  'yogurt',
-  'yoghurt',
-]
 
 function tokenize(query: string): string[] {
   return query
@@ -55,21 +34,11 @@ function scoreMockSuggestion(suggestion: ProductSuggestion, query: string): numb
   return score
 }
 
-function personalizationBoost(mock: ProductSuggestion, hit: WaitroseCatalogItem): number {
-  const mockHay = `${mock.title} ${mock.size}`.toLowerCase()
-  const hitHay = hit.name.toLowerCase()
-  let boost = 0
-  if (mock.source === 'favourite') boost += 12
-  if (mock.source === 'previous-purchase') boost += 8
-  for (const token of mockHay.split(/\s+/).filter((t) => t.length >= 4 && !ENRICHMENT_SKIP_TOKENS.has(t))) {
-    if (hitHay.includes(token)) boost += 5
-  }
-  return boost
-}
-
 function catalogToSuggestion(hit: WaitroseCatalogItem): ProductSuggestion {
-  const sizeMatch = hit.name.match(/\([^)]+\)\s*$/)
-  const size = sizeMatch ? sizeMatch[0].replace(/[()]/g, '') : hit.unitPrice || ''
+  const size =
+    hit.size?.trim() ||
+    (hit.name.match(/\([^)]+\)\s*$/)?.[0]?.replace(/[()]/g, '') ?? '') ||
+    ''
   return {
     id: `catalog-${hit.id}`,
     title: hit.name.replace(/\s*\([^)]+\)\s*$/, '').trim() || hit.name,
@@ -81,48 +50,62 @@ function catalogToSuggestion(hit: WaitroseCatalogItem): ProductSuggestion {
   }
 }
 
-function enrichmentCompatible(
-  suggestion: ProductSuggestion,
-  hit: WaitroseCatalogItem,
-  query: string,
-): boolean {
-  const hitHay = hit.name.toLowerCase()
-  const q = query.toLowerCase().trim()
-
-  for (const term of CATEGORY_TERMS) {
-    if (q.includes(term) && !hitHay.includes(term)) return false
+function waitroseItemFromCatalogueProduct(product: CatalogueProduct): WaitroseCatalogItem {
+  const size = product.size.trim()
+  return {
+    id: product.id,
+    name: size ? `${product.name} (${size})` : product.name,
+    price: Math.max(0, product.numericPrice),
+    unitPrice: product.formattedPPU.trim() || size || '—',
+    imageUrl: product.imageUrl.trim(),
+    productUrl: '',
+    productType: product.productType.trim() || undefined,
+    grouping: product.grouping.trim() || undefined,
+    popmasType: product.type.trim() || undefined,
+    offers: product.offers.trim() || undefined,
+    size: size || undefined,
+    displayPrice: product.price || undefined,
   }
-
-  const mockTokens = `${suggestion.title} ${suggestion.size}`
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length >= 4 && !ENRICHMENT_SKIP_TOKENS.has(t))
-
-  if (mockTokens.length === 0) return true
-  return mockTokens.some((t) => hitHay.includes(t))
 }
 
-/** Narrow POPMAS before full scoring so autocomplete stays responsive on each keystroke. */
-function narrowCatalogForQuery(query: string, products: WaitroseCatalogItem[]): WaitroseCatalogItem[] {
-  const tokens = tokenize(query)
-  if (tokens.length === 0) return []
-
-  let filtered = products
-  for (const token of tokens) {
-    filtered = filtered.filter((p) => {
-      const words = p.name.toLowerCase().split(/\s+/)
-      if (token.length === 1) {
-        return words.some((w) => w.startsWith(token))
-      }
-      return p.name.toLowerCase().includes(token)
-    })
-  }
-
-  if (filtered.length > 500) return filtered.slice(0, 500)
-  return filtered
+/**
+ * Map WaitroseCatalogItem rows back toward catalogue search fields.
+ * Used when the UI already holds WaitroseCatalogItem[] in memory.
+ */
+function toSearchableCatalogueShape(products: WaitroseCatalogItem[]): CatalogueProduct[] {
+  return products.map((p) => {
+    const size =
+      p.size?.trim() ||
+      (p.name.match(/\([^)]+\)\s*$/)?.[0]?.replace(/[()]/g, '') ?? '') ||
+      ''
+    const name = p.name.replace(/\s*\([^)]+\)\s*$/, '').trim() || p.name
+    return {
+      id: p.id,
+      order: null,
+      imageUrl: p.imageUrl,
+      name,
+      size,
+      price: p.displayPrice ?? (p.price > 0 ? `£${p.price.toFixed(2)}` : ''),
+      numericPrice: p.price,
+      formattedPPU: p.unitPrice === '—' ? '' : p.unitPrice,
+      score: null,
+      recommendedQuantity: null,
+      category: '',
+      otherCategory1: '',
+      otherCategory2: '',
+      productType: p.productType ?? '',
+      productTypeRecCount: null,
+      offers: p.offers ?? '',
+      grouping: p.grouping ?? '',
+      type: p.popmasType ?? '',
+      model: '',
+      sourceFile: 'in-memory',
+      itemId: undefined,
+    }
+  })
 }
 
-/** Enrich a mock suggestion with live POPMAS name, price, and image when available. */
+/** Enrich a suggestion with live catalogue name, price, and image when available. */
 export function enrichSuggestionFromCatalog(
   suggestion: ProductSuggestion,
   catalogProducts: WaitroseCatalogItem[],
@@ -137,63 +120,57 @@ export function enrichSuggestionFromCatalog(
   }
 
   const q = query.trim() || `${suggestion.title} ${suggestion.size}`
-  const pool = narrowCatalogForQuery(q, catalogProducts)
-  const hits = topCatalogMatches(q, pool.length > 0 ? pool : catalogProducts.slice(0, 500), 6, undefined)
-  const compatible = hits.find((hit) => enrichmentCompatible(suggestion, hit, q))
-  if (!compatible) return suggestion
-
-  const enriched = catalogToSuggestion(compatible)
+  const hits = searchCatalogue(q, 6, toSearchableCatalogueShape(catalogProducts))
+  const first = hits[0]
+  if (!first) return suggestion
   return {
-    ...enriched,
+    ...catalogToSuggestion(waitroseItemFromCatalogueProduct(first)),
     id: suggestion.id,
     source: suggestion.source,
   }
 }
 
+function resolveSearchPool(catalogProducts: WaitroseCatalogItem[]): CatalogueProduct[] {
+  const cached = getCachedProducts()
+  if (cached.length > 0) return cached
+  if (catalogProducts.length > 0) return toSearchableCatalogueShape(catalogProducts)
+  return []
+}
+
+/**
+ * Autosuggest against the CSV-backed Waitrose catalogue.
+ * Prefers name matches over category matches; returns up to `limit` results.
+ */
 export function searchProductSuggestions(
   query: string,
   catalogProducts: WaitroseCatalogItem[] = [],
-  limit = 6,
+  limit = 8,
 ): ProductSuggestion[] {
   const q = query.trim()
   if (q.length < 1) return []
 
-  const personalizationMocks = ALL_MOCK_SUGGESTIONS.map((s) => ({
+  const pool = resolveSearchPool(catalogProducts)
+  if (pool.length > 0) {
+    const hits = searchCatalogue(q, limit, pool)
+    if (hits.length > 0) {
+      return hits.map((hit) => catalogToSuggestion(waitroseItemFromCatalogueProduct(hit)))
+    }
+  }
+
+  // Fallback to local mock suggestions only when the catalogue has no hits yet.
+  return ALL_MOCK_SUGGESTIONS.map((s) => ({
     suggestion: s,
     score: scoreMockSuggestion(s, q),
   }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5)
-    .map((x) => x.suggestion)
-
-  if (catalogProducts.length > 0) {
-    const pool = narrowCatalogForQuery(q, catalogProducts)
-    const hits = topCatalogMatches(q, pool.length > 0 ? pool : catalogProducts.slice(0, 500), limit + 6, q)
-
-    const scored = hits.map((hit, index) => {
-      const suggestion = catalogToSuggestion(hit)
-      let score = (hits.length - index) * 12 + scoreMockSuggestion(suggestion, q)
-      for (const mock of personalizationMocks) {
-        score += personalizationBoost(mock, hit)
-      }
-      return { suggestion, score }
-    })
-
-    return scored
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map((x) => x.suggestion)
-  }
-
-  return personalizationMocks
-    .map((s) => ({ suggestion: s, score: scoreMockSuggestion(s, q) }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map((x) => x.suggestion)
 }
 
-export function searchAmbiguousOptions(term: string, catalogProducts: WaitroseCatalogItem[] = []): ProductSuggestion[] {
+export function searchAmbiguousOptions(
+  term: string,
+  catalogProducts: WaitroseCatalogItem[] = [],
+): ProductSuggestion[] {
   return searchProductSuggestions(term, catalogProducts, 3)
 }

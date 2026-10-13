@@ -31,6 +31,12 @@ import {
   type Cuisine,
 } from './data/mealRecipes'
 import { formatIngredientNeedLabel } from './lib/resolveMealIngredients'
+import {
+  clearMealBuilderStorage,
+  getFolders,
+  saveFolders,
+  type StoredFolder,
+} from './services/mealStorage'
 
 type DietOption = 'Vegetarian' | 'Vegan' | 'Gluten free' | 'Pescatarian'
 type RangeOption = 'No 1 Range' | 'Essentials' | 'Organic'
@@ -90,7 +96,7 @@ type Ingredient = {
   selected: boolean
   image: string
   productType?: string
-  /** Internal: whether this ingredient was matched to a real POPMAS / catalog product. */
+  /** Internal: whether this ingredient was matched to a real catalogue product. */
   matched?: boolean
   /** Internal: set when `matched === false` and a fallback ingredient row was created. */
   fallbackReason?: 'no-popmas-match'
@@ -315,36 +321,12 @@ function mergeSwapCatalogs(
 
 type AppView = 'index' | 'mealList' | 'mealDraft' | 'trolley' | 'favourites'
 
-/** Shop Meal Builder folder persistence (survives refresh). */
-const STORAGE_KEY = 'shop-meal-builder-folders'
-
 function loadSavedListsFromStorage(): SavedList[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter(
-        (entry): entry is SavedList =>
-          Boolean(entry) &&
-          typeof entry === 'object' &&
-          typeof (entry as SavedList).id === 'string' &&
-          typeof (entry as SavedList).name === 'string' &&
-          Array.isArray((entry as SavedList).mealGroups),
-      )
-      .map((entry) => ({
-        ...entry,
-        mealGroups: entry.mealGroups.map((meal) => ({
-          ...meal,
-          ingredients: Array.isArray(meal.ingredients) ? meal.ingredients : [],
-        })),
-        essentials: Array.isArray(entry.essentials) ? entry.essentials : [],
-        generated: Boolean(entry.generated),
-      }))
-  } catch {
-    return []
-  }
+  return getFolders() as SavedList[]
+}
+
+function persistFolders(folders: SavedList[]): void {
+  saveFolders(folders as StoredFolder[])
 }
 
 function mergeAppendBuildOntoTrolley(
@@ -1281,7 +1263,7 @@ function cloneMealGroup(meal: MealGroup): MealGroup {
 
 function getCatalogErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message
-  return 'Could not load POPMAS. Check Supabase configuration and access.'
+  return 'Could not load the product catalogue. Check that CSV files are available under /data/products.'
 }
 
 /** Active Build Preferences count from current state (non-default selections only). */
@@ -1631,7 +1613,7 @@ function App() {
         setSwapAltsLoading(false)
       })
       .catch((err) => {
-        if (DEBUG_MEAL_RECIPE_BUILD) console.error('[swap] POPMAS error', err)
+        if (DEBUG_MEAL_RECIPE_BUILD) console.error('[swap] catalogue error', err)
         setSwapAlternativePool([])
         setSwapAltsLoading(false)
       })
@@ -1907,7 +1889,7 @@ function App() {
             l.id === activeListId ? { ...l, mealGroups, essentials, generated } : l,
           )
         : savedLists
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore))
+      persistFolders(toStore)
       if (saveStatusTimerRef.current != null) window.clearTimeout(saveStatusTimerRef.current)
       saveStatusTimerRef.current = window.setTimeout(() => {
         setSaveStatus('saved')
@@ -2374,9 +2356,7 @@ function App() {
     setImageProcessing(true)
     void (async () => {
       try {
-        // Try Google Vision API first — it handles handwritten and printed lists
-        // far more reliably than local Tesseract.  Fall back to Tesseract when
-        // Supabase is not configured or the edge function call fails.
+        // Prefer cloud Vision when available; otherwise fall back to on-device Tesseract.
         const visionResult = await runVisionOcr(file)
         if (uploadGen !== uploadGenerationRef.current) return
 
@@ -2710,7 +2690,7 @@ function App() {
     }
   }
 
-  /** Add a POPMAS product from meal-scoped Add item autocomplete. */
+  /** Add a catalogue product from meal-scoped Add item autocomplete. */
   function addProductToMeal(mealId: string, suggestion: ProductSuggestion, query: string) {
     void query
     const ingredient = suggestionToIngredient(suggestion, suggestion.title)
@@ -3135,19 +3115,8 @@ function App() {
 
   function resetPrototype() {
     // Clear Shop Meal Builder prototype-only keys; never touch sibling prototypes' keys
-    // (shop-single-meal-*, shop-by-meals-*), unrelated storage, or Supabase.
-    try {
-      localStorage.removeItem('wtr-autosave-banner-dismissed')
-      localStorage.removeItem(STORAGE_KEY)
-      localStorage.removeItem('shop-meal-builder-state')
-      for (const key of Object.keys(localStorage)) {
-        if (key.startsWith('shop-meal-builder-')) {
-          localStorage.removeItem(key)
-        }
-      }
-    } catch {
-      // Ignore storage failures (e.g. private mode).
-    }
+    // (shop-single-meal-*, shop-by-meals-*) or unrelated storage.
+    clearMealBuilderStorage()
     uploadGenerationRef.current += 1
     listBuildGenerationRef.current += 1
     resultsFromChipRef.current = false
@@ -3270,7 +3239,7 @@ function App() {
     forceMultiItem: forceMultiItemMode,
   })
 
-  // Top meal textarea intentionally has no POPMAS product autocomplete.
+  // Top meal textarea intentionally has no product autocomplete.
   // Product search lives inside each meal via Add item (MealAddItem).
 
   useLayoutEffect(() => {

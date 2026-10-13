@@ -20,18 +20,18 @@ npm run dev
 
 Runs on [http://localhost:5182](http://localhost:5182).
 
-Requires `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in `.env.local` for the POPMAS product catalogue (same as sibling Waitrose prototypes).
+No environment variables are required. The Waitrose product catalogue is loaded from CSV files in `public/data/products/`. Folders, meals, and items persist in browser localStorage.
 
 ## Core journey
 
 1. Create or open a folder
-2. **+ Create meal** → name the meal
+2. Create a meal (inline name + Create meal)
 3. Enter the empty Meal Builder
-4. Search → autosuggest (from 2 characters) → select
+4. Search → autosuggest → select
 5. Item is added immediately and autosaved
 6. Repeat; shop selected items to trolley when ready
 
-## Foundations reused
+## Data architecture
 
-- Waitrose chrome, folders, meal cards, swap, quantity, trolley from Shop Single Meal
-- Product autosuggest from Shopping Lists (via `meal-add-item.tsx` / `product-autocomplete.tsx` / `productAutocomplete.ts`)
+- **Products:** static CSVs under `/public/data/products` → `src/services/productCatalogue.ts`
+- **Folders / meals / items:** browser `localStorage` → `src/services/mealStorage.ts`

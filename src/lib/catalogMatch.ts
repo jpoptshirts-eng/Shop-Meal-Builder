@@ -325,7 +325,7 @@ export function topCatalogMatches(
     .map(({ p }) => p)
 }
 
-/** Best POPMAS / catalog row for a free-text line (e.g. from a handwritten list). */
+/** Best catalog row for a free-text line (e.g. from a handwritten list). */
 export function bestCatalogMatch(
   query: string,
   products: WaitroseCatalogItem[],
